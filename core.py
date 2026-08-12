@@ -8,10 +8,13 @@ be unit-tested without booting a Streamlit session or touching the network.
 from __future__ import annotations
 
 import io
+import json
+import os
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 import numpy as np
-from PIL import Image, UnidentifiedImageError
+from PIL import Image, ImageOps, UnidentifiedImageError
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -32,6 +35,17 @@ MAX_UPLOAD_SIZE_MB = 10
 # the activation map for Grad-CAM. Verified against the shipped model via
 # model.summary(): conv2d -> maxpool -> conv2d_1 -> maxpool -> flatten -> ...
 LAST_CONV_LAYER_NAME = "conv2d_1"
+
+# Where prediction audit records are appended (one JSON object per line),
+# overridable per-deployment (e.g. a mounted volume in Docker) via the
+# FIRE_DETECTION_LOG_PATH env var. This fallback is intentionally *not*
+# resolved from the environment here at import time: core.py can end up
+# imported (directly or transitively) before a caller has finished setting
+# up its environment — e.g. pytest imports every test module during
+# collection, before any fixture runs — which would otherwise freeze this
+# constant to the wrong value for the rest of the process. log_prediction()
+# below reads the env var itself, at call time, instead.
+DEFAULT_LOG_PATH = os.path.join("logs", "predictions.jsonl")
 
 
 class ImageValidationError(ValueError):
@@ -59,6 +73,12 @@ def load_image_from_bytes(file_bytes: bytes) -> Image.Image:
 
     Catches truncated files, non-image files (e.g. a renamed .pdf), and
     zero-byte payloads, all of which crash a bare ``Image.open`` call.
+
+    Also normalizes EXIF orientation (``ImageOps.exif_transpose``) before
+    returning. Phone/drone photos frequently store pixel data "as captured"
+    plus an EXIF orientation tag telling viewers how to rotate it; skipping
+    this step silently feeds the model a sideways or upside-down image while
+    every *displayed* preview of the same file looks upright.
     """
     try:
         image = Image.open(io.BytesIO(file_bytes))
@@ -70,6 +90,7 @@ def load_image_from_bytes(file_bytes: bytes) -> Image.Image:
     except Exception as exc:  # noqa: BLE001 - surfaced to the user, not swallowed
         raise ImageValidationError(f"Could not read this image file: {exc}") from exc
 
+    image = ImageOps.exif_transpose(image)  # no-op if there's no orientation tag
     return image.convert("RGB")
 
 
@@ -84,6 +105,23 @@ def preprocess_image(image: Image.Image, target_size: tuple[int, int] = INPUT_SH
             "Is this a valid RGB image?"
         )
     return array.reshape(1, *target_size, 3)
+
+
+# ---------------------------------------------------------------------------
+# Model loading
+# ---------------------------------------------------------------------------
+
+def load_fire_model(model_path: str = "fire_detection_model.h5"):
+    """Load the pretrained Keras fire-detection model from disk.
+
+    Framework-free (no Streamlit dependency) so the same loader can back the
+    Streamlit app, the REST API, and the CLI without duplicating this logic
+    three times. Callers own their own caching strategy (e.g. Streamlit's
+    ``st.cache_resource``, or a plain module-level singleton for api.py/cli.py).
+    """
+    from tensorflow.keras.models import load_model
+
+    return load_model(model_path)
 
 
 # ---------------------------------------------------------------------------
@@ -128,6 +166,35 @@ def classify(
         fire_probability=fire_probability,
         confidence_pct=confidence,
     )
+
+
+# ---------------------------------------------------------------------------
+# Prediction audit logging
+# ---------------------------------------------------------------------------
+
+def log_prediction(record: dict, log_path: str | None = None) -> None:
+    """Append one JSON-line audit record for a prediction.
+
+    Shared by app.py, api.py, and cli.py so every prediction made through any
+    interface leaves a consistent, greppable trail (timestamp, source,
+    filename, verdict, probability, threshold) — useful for after-the-fact
+    triage of what the model called and when, which a stateless demo app
+    otherwise has no record of.
+
+    Best-effort by design: a logging failure (read-only filesystem, disk
+    full, bad path) is swallowed rather than raised, since a prediction that
+    already succeeded should never fail *because logging it* failed.
+    """
+    path = log_path if log_path is not None else os.environ.get("FIRE_DETECTION_LOG_PATH", DEFAULT_LOG_PATH)
+    entry = {"timestamp": datetime.now(timezone.utc).isoformat(), **record}
+    try:
+        dir_name = os.path.dirname(path)
+        if dir_name:
+            os.makedirs(dir_name, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
+    except OSError:
+        pass
 
 
 # ---------------------------------------------------------------------------

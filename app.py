@@ -10,7 +10,9 @@ from core import (
     MAX_UPLOAD_SIZE_MB,
     ImageValidationError,
     classify,
+    load_fire_model,
     load_image_from_bytes,
+    log_prediction,
     make_gradcam_heatmap,
     overlay_heatmap_on_image,
     predict_fire_probability,
@@ -26,14 +28,12 @@ st.write("Upload a satellite image to detect the presence of fire.")
 
 
 @st.cache_resource(show_spinner="Loading model...")
-def load_fire_model():
-    from tensorflow.keras.models import load_model
-
-    return load_model("fire_detection_model.h5")
+def get_cached_model():
+    return load_fire_model("fire_detection_model.h5")
 
 
 try:
-    model = load_fire_model()
+    model = get_cached_model()
 except Exception as exc:  # noqa: BLE001 - this is a hard stop for the whole app
     st.error(
         "Couldn't load `fire_detection_model.h5`. Make sure the model file is present "
@@ -108,6 +108,17 @@ if mode == "Single Image":
             if error:
                 st.error(f"Prediction failed: {error}")
             else:
+                log_prediction(
+                    {
+                        "source": "streamlit-single",
+                        "filename": uploaded_file.name,
+                        "prediction": result.label,
+                        "predicted_class": result.predicted_class,
+                        "fire_probability": result.fire_probability,
+                        "confidence_pct": result.confidence_pct,
+                        "threshold": threshold,
+                    }
+                )
                 st.subheader("Result:")
                 if result.predicted_class == 1:
                     st.error(f"Prediction: **🔥 {result.label}**")
@@ -163,6 +174,17 @@ else:
                         row["prediction"] = result.label
                         row["confidence_pct"] = round(result.confidence_pct, 2)
                         row["fire_probability"] = round(result.fire_probability, 4)
+                        log_prediction(
+                            {
+                                "source": "streamlit-batch",
+                                "filename": uploaded_file.name,
+                                "prediction": result.label,
+                                "predicted_class": result.predicted_class,
+                                "fire_probability": result.fire_probability,
+                                "confidence_pct": result.confidence_pct,
+                                "threshold": threshold,
+                            }
+                        )
                 except ImageValidationError as exc:
                     row["error"] = str(exc)
 

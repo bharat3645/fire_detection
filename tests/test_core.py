@@ -6,6 +6,7 @@ Run with:
 """
 
 import io
+import json
 import os
 
 import numpy as np
@@ -94,6 +95,27 @@ def test_load_image_from_bytes_converts_non_rgb_to_rgb():
     img.save(buf, format="PNG")
     result = core.load_image_from_bytes(buf.getvalue())
     assert result.mode == "RGB"
+
+
+def test_load_image_from_bytes_applies_exif_orientation():
+    # A landscape 60x30 image tagged "needs a 90-degree rotation to display
+    # upright" must come back portrait (30x60). Without normalizing this,
+    # real-world phone/drone photos get fed to the model sideways while
+    # looking perfectly upright in every image viewer.
+    img = Image.new("RGB", (60, 30), (200, 30, 10))
+    exif = img.getexif()
+    exif[0x0112] = 6  # Orientation tag: rotate 90 CW needed
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", exif=exif)
+
+    result = core.load_image_from_bytes(buf.getvalue())
+    assert result.size == (30, 60)
+
+
+def test_load_image_from_bytes_handles_missing_exif_gracefully():
+    data = _make_image_bytes(size=(80, 60))
+    image = core.load_image_from_bytes(data)
+    assert image.size == (80, 60)
 
 
 # ---------------------------------------------------------------------------
@@ -225,3 +247,45 @@ def test_real_model_end_to_end_pipeline():
 
     heatmap = core.make_gradcam_heatmap(img_array, model)
     assert heatmap.shape[0] > 0 and heatmap.shape[1] > 0
+
+
+@pytest.mark.skipif(not os.path.exists(_MODEL_PATH), reason="fire_detection_model.h5 not present")
+def test_load_fire_model_returns_a_usable_model():
+    # This is the loader shared by app.py, api.py, and cli.py — a regression
+    # here would silently break all three entry points at once.
+    model = core.load_fire_model(_MODEL_PATH)
+    assert hasattr(model, "predict")
+
+
+def test_load_fire_model_raises_on_missing_file(tmp_path):
+    with pytest.raises(Exception):  # noqa: B017 - Keras raises its own IOError/ValueError variants
+        core.load_fire_model(str(tmp_path / "does_not_exist.h5"))
+
+
+# ---------------------------------------------------------------------------
+# log_prediction
+# ---------------------------------------------------------------------------
+
+def test_log_prediction_appends_jsonl_lines(tmp_path):
+    log_path = tmp_path / "nested" / "predictions.jsonl"  # nested dir must be auto-created
+
+    core.log_prediction({"source": "test", "prediction": "Fire"}, log_path=str(log_path))
+    core.log_prediction({"source": "test", "prediction": "No Fire"}, log_path=str(log_path))
+
+    lines = log_path.read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 2
+
+    first = json.loads(lines[0])
+    assert first["prediction"] == "Fire"
+    assert "timestamp" in first
+
+
+def test_log_prediction_never_raises_when_parent_path_is_not_a_directory(tmp_path):
+    # Logging is best-effort: a broken log destination must never crash the
+    # caller (Streamlit app / API / CLI), since the prediction it's logging
+    # already succeeded.
+    blocking_file = tmp_path / "not_a_directory"
+    blocking_file.write_text("x")
+    bad_log_path = blocking_file / "predictions.jsonl"
+
+    core.log_prediction({"source": "test"}, log_path=str(bad_log_path))  # must not raise
